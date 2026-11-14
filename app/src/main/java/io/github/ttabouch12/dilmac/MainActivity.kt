@@ -90,7 +90,7 @@ class MainActivity : ComponentActivity() {
             }
         })
         val askMic = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) setListening(true) else status = "Dilmaç needs the microphone to hear the conversation"
+            if (granted) switchListening(true) else status = "Dilmaç needs the microphone to hear the conversation"
         }
         setContent {
             DilmacTheme {
@@ -104,14 +104,14 @@ class MainActivity : ComponentActivity() {
                     onSpeakEnglish = { speakEnglish = it; engine.speakEnglish = it },
                     onMic = {
                         when {
-                            listening -> setListening(false)
-                            checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED -> setListening(true)
+                            listening -> switchListening(false)
+                            checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED -> switchListening(true)
                             else -> askMic.launch(Manifest.permission.RECORD_AUDIO)
                         }
                     },
                     onClear = { lines.clear() },
                     onLab = {
-                        setListening(false)
+                        switchListening(false)
                         startActivity(Intent(this, LabActivity::class.java))
                     },
                 )
@@ -119,7 +119,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun setListening(on: Boolean) {
+    private fun switchListening(on: Boolean) {
         listening = on
         if (on) {
             engine.start()
