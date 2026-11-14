@@ -63,20 +63,6 @@ class LiveTranslator(private val ctx: Context, private val listener: Listener) {
     private val mineGuess = HashMap<Long, Boolean>()
     private val pendingAudio = HashMap<String, File>()
 
-    init {
-        recognizer.setRecognitionListener(recognition)
-        tts = TextToSpeech(ctx) { status ->
-            ttsReady = status == TextToSpeech.SUCCESS
-            tts?.setOnUtteranceProgressListener(ttsProgress)
-        }
-        // Download (first run only) and warm both models so the first real translation is fast.
-        listOf(trEn to "merhaba", enTr to "hello").forEach { (t, word) ->
-            t.downloadModelIfNeeded()
-                .addOnSuccessListener { t.translate(word) }
-                .addOnFailureListener { listener.onStatus("Translation model download failed – check internet once") }
-        }
-    }
-
     fun start() {
         running = true
         listen()
@@ -250,6 +236,21 @@ class LiveTranslator(private val ctx: Context, private val listener: Listener) {
             AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, AudioDeviceInfo.TYPE_BLE_HEADSET,
             AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES, AudioDeviceInfo.TYPE_USB_HEADSET,
         )
+    }
+
+    // Last in the class: the listeners it registers must already exist.
+    init {
+        recognizer.setRecognitionListener(recognition)
+        tts = TextToSpeech(ctx) { status ->
+            ttsReady = status == TextToSpeech.SUCCESS
+            tts?.setOnUtteranceProgressListener(ttsProgress)
+        }
+        // Download (first run only) and warm both models so the first real translation is fast.
+        listOf(trEn to "merhaba", enTr to "hello").forEach { (t, word) ->
+            t.downloadModelIfNeeded()
+                .addOnSuccessListener { t.translate(word) }
+                .addOnFailureListener { listener.onStatus("Translation model download failed – check internet once") }
+        }
     }
 
     private fun options(from: String, to: String) =
