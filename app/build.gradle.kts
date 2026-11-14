@@ -1,6 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
@@ -11,9 +12,13 @@ android {
         applicationId = "io.github.ttabouch12.dilmac"
         minSdk = 33
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1-lab"
+        versionCode = 2
+        versionName = "0.2"
+        // shortcut: arm64 only (every recent phone, incl. Pixel 9); add ABIs if an old 32-bit phone needs it.
+        ndk { abiFilters += "arm64-v8a" }
     }
+
+    buildFeatures { compose = true }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -25,6 +30,11 @@ android {
 dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.google.mlkit:translate:17.0.3")
+    implementation("com.google.mlkit:language-id:17.0.6")
+    implementation(platform("androidx.compose:compose-bom:2024.12.01"))
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-core")
+    implementation("androidx.activity:activity-compose:1.9.3")
     testImplementation("junit:junit:4.13.2")
     // Android's org.json is a stub in local unit tests; the real one runs GeminiLive.parse there.
     testImplementation("org.json:json:20240303")

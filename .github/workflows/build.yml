@@ -28,7 +28,19 @@ jobs:
           if [ -n "$KS" ]; then mkdir -p ~/.android && echo "$KS" | base64 -d > ~/.android/debug.keystore; fi
 
       - name: Test and build
-        run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon testDebugUnitTest assembleDebug 2>&1 | tee build.log
+
+      # Public copy of the log so failures can be read without signing in.
+      - name: Publish log of a failed build
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete build-log --yes --cleanup-tag || true
+          gh release create build-log build.log --prerelease --title "Last failed build log" --notes "From ${GITHUB_SHA}"
 
       - name: Publish to the "latest" release
         env:
