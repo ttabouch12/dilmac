@@ -12,8 +12,8 @@ android {
         applicationId = "io.github.ttabouch12.dilmac"
         minSdk = 33
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.4"
+        versionCode = 5
+        versionName = "0.5"
         // shortcut: arm64 only (every recent phone, incl. Pixel 9); add ABIs if an old 32-bit phone needs it.
         ndk { abiFilters += "arm64-v8a" }
     }

@@ -2,6 +2,7 @@ package io.github.ttabouch12.dilmac
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
@@ -20,8 +21,17 @@ import kotlin.math.sqrt
  * audio is kept (last 20 s) for voice fingerprints. Audio recorded while no recogniser is
  * attached (between sessions) is replayed into the next pipe, so no words are lost.
  */
-class MicFeed {
+class MicFeed(
+    private val source: Int = MediaRecorder.AudioSource.VOICE_RECOGNITION,
+    private val device: AudioDeviceInfo? = null,
+) {
     private val ring = FloatArray(RATE * 20)
+    /** Loudness of the last 100 ms, 0..1, for the on-screen level meter. */
+    @Volatile var level = 0f
+        private set
+    /** [position] at the end of the last moment someone was speaking. */
+    @Volatile var lastVoice = 0L
+        private set
     @Volatile private var written = 0L
     @Volatile private var running = false
     /** Feed silence instead of the mic, e.g. while our own voice plays from the speaker. */
@@ -36,8 +46,9 @@ class MicFeed {
     fun start(): Boolean {
         if (running) return true
         val min = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        val r = AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, min * 8)
+        val r = AudioRecord(source, RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, min * 8)
         if (r.state != AudioRecord.STATE_INITIALIZED) { r.release(); return false }
+        device?.let { r.setPreferredDevice(it) }
         val gen = ++generation // a quick stop+start must not leave the old thread running
         running = true
         r.startRecording()
@@ -50,8 +61,16 @@ class MicFeed {
                 if (n <= 0) continue
                 if (muted) buf.fill(0.toShort(), 0, n)
                 val base = written
-                for (i in 0 until n) ring[((base + i) % ring.size).toInt()] = buf[i] / 32768f
+                var sum = 0f
+                for (i in 0 until n) {
+                    val v = buf[i] / 32768f
+                    ring[((base + i) % ring.size).toInt()] = v
+                    sum += v * v
+                }
                 written = base + n
+                val rms = sqrt(sum / n)
+                level = minOf(1f, rms * 8)
+                if (rms > SPEECH_RMS) lastVoice = base + n
                 val bytes = ByteArray(n * 2)
                 for (i in 0 until n) { bytes[2 * i] = buf[i].toInt().toByte(); bytes[2 * i + 1] = (buf[i].toInt() shr 8).toByte() }
                 next?.let { fresh ->
@@ -68,11 +87,13 @@ class MicFeed {
                 }
             }
             closeQuietly(out)
+            level = 0f
             r.stop()
             r.release()
         }
         return true
     }
+
 
     /** True if anyone spoke (not just background noise) in the last [ms] milliseconds. */
     fun heardSpeech(ms: Int): Boolean {
@@ -82,7 +103,7 @@ class MicFeed {
         while (p + RATE / 10 <= end) {
             var sum = 0f
             for (i in 0 until RATE / 10) { val v = ring[((p + i) % ring.size).toInt()]; sum += v * v }
-            if (sqrt(sum / (RATE / 10)) > 0.02f) return true
+            if (sqrt(sum / (RATE / 10)) > SPEECH_RMS) return true
             p += RATE / 10
         }
         return false
@@ -112,6 +133,7 @@ class MicFeed {
 
     companion object {
         const val RATE = 16000
+        const val SPEECH_RMS = 0.02f
 
         /** Drops quiet 30 ms frames so pauses between words don't blur a voice fingerprint. */
         fun voiceOnly(samples: FloatArray): FloatArray {
@@ -162,16 +184,22 @@ class SpeakerId(ctx: Context) {
 }
 
 /**
- * Online clustering of voice fingerprints: a voice joins the closest known speaker when the
- * cosine similarity to that speaker's average is at least [threshold]; otherwise it's someone new.
+ * Online clustering of voice fingerprints. A sentence joins the closest known speaker when the
+ * cosine similarity is at least [join]; it becomes a new person only when it is clearly different
+ * (below [split]) and long enough to trust. In between it goes to the closest speaker without
+ * changing that speaker's profile, so one unclear sentence can't blur someone's voice.
  */
-class SpeakerTracker(private val threshold: Float = 0.45f, private val maxSpeakers: Int = 8) {
+class SpeakerTracker(
+    private val join: Float = 0.55f,
+    private val split: Float = 0.35f,
+    private val maxSpeakers: Int = 8,
+) {
     private val centroids = mutableListOf<FloatArray>()
     private val counts = mutableListOf<Int>()
 
     /** @return speaker number, starting at 1, and the similarity that decided it. */
     @Synchronized
-    fun assign(embedding: FloatArray): Pair<Int, Float> {
+    fun assign(embedding: FloatArray, canBeNew: Boolean = true): Pair<Int, Float> {
         val e = normalize(embedding)
         var best = -1
         var bestSim = -1f
@@ -179,17 +207,20 @@ class SpeakerTracker(private val threshold: Float = 0.45f, private val maxSpeake
             val s = dot(c, e)
             if (s > bestSim) { bestSim = s; best = i }
         }
-        if (best >= 0 && (bestSim >= threshold || centroids.size >= maxSpeakers)) {
-            val n = counts[best]
+        val isNew = best < 0 || (bestSim < split && canBeNew && centroids.size < maxSpeakers)
+        if (isNew) {
+            centroids += e
+            counts += 1
+            return centroids.size to bestSim
+        }
+        if (bestSim >= join) {
+            val n = minOf(counts[best], 20) // recent sentences keep counting, so the profile can adapt
             val c = centroids[best]
             for (k in c.indices) c[k] = (c[k] * n + e[k]) / (n + 1)
             centroids[best] = normalize(c)
-            counts[best] = n + 1
-            return best + 1 to bestSim
+            counts[best] = counts[best] + 1
         }
-        centroids += e
-        counts += 1
-        return centroids.size to bestSim
+        return best + 1 to bestSim
     }
 
     @Synchronized
