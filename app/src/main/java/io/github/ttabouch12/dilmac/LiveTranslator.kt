@@ -536,7 +536,7 @@ class LiveTranslator(private val ctx: Context, private val listener: Listener) {
             t.setAudioAttributes(outputAttributes())
             t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "preview")
         }
-        if (lang.code == "en") return say(PREVIEW)
+        if (lang.code == "en") { say(PREVIEW); return }
         val tr = translator("en", lang.code)
         tr.downloadModelIfNeeded()
             .continueWithTask { tr.translate(PREVIEW) }
