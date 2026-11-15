@@ -12,13 +12,14 @@ android {
         applicationId = "io.github.ttabouch12.dilmac"
         minSdk = 33
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2"
+        versionCode = 3
+        versionName = "0.3"
         // shortcut: arm64 only (every recent phone, incl. Pixel 9); add ABIs if an old 32-bit phone needs it.
         ndk { abiFilters += "arm64-v8a" }
     }
 
     buildFeatures { compose = true }
+    androidResources { noCompress += "onnx" }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -31,6 +32,8 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.google.mlkit:translate:17.0.3")
     implementation("com.google.mlkit:language-id:17.0.6")
+    // Speaker ID (sherpa-onnx). CI downloads the AAR and the voice model; see .github/workflows/build.yml.
+    implementation(files("libs/sherpa-onnx-1.13.8.aar"))
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-core")

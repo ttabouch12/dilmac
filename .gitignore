@@ -6,3 +6,5 @@ local.properties
 *.keystore
 *.jks
 graphify-out/
+app/libs/*.aar
+app/src/main/assets/*.onnx

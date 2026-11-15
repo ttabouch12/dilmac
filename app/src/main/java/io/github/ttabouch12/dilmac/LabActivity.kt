@@ -1,12 +1,10 @@
 package io.github.ttabouch12.dilmac
 
 import android.Manifest
-import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Typeface
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
@@ -24,12 +22,42 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
-import android.text.InputType
-import android.widget.Button
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.Card
+import androidx.compose.material3.ElevatedCard
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.ListItem
+import androidx.compose.material3.ListItemDefaults
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.unit.dp
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.Translator
@@ -39,14 +67,13 @@ import kotlin.concurrent.thread
 import kotlin.math.sqrt
 
 /**
- * Step-0 lab: measures every engine the real app will choose between, on this phone.
- * Each button logs timings; "Copy report" puts the whole log on the clipboard.
+ * Engine lab: measures every engine the app can choose between, on this phone.
+ * Each test logs timings; "Copy report" puts the whole log on the clipboard.
  */
-class LabActivity : Activity() {
-    private lateinit var logView: TextView
-    private lateinit var scroll: ScrollView
-    private lateinit var keyField: EditText
+class LabActivity : ComponentActivity() {
     private val report = StringBuilder()
+    private var logText by mutableStateOf("")
+    private var apiKey by mutableStateOf("")
 
     private val trEn: Translator by lazy { translator(TranslateLanguage.TURKISH, TranslateLanguage.ENGLISH) }
     private val enTr: Translator by lazy { translator(TranslateLanguage.ENGLISH, TranslateLanguage.TURKISH) }
@@ -54,41 +81,80 @@ class LabActivity : Activity() {
     private var tts: TextToSpeech? = null
     @Volatile private var geminiRunning = false
 
+    private class Test(val title: String, val detail: String, val run: () -> Unit)
+
+    @OptIn(ExperimentalMaterial3Api::class)
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         val prefs = getSharedPreferences("lab", MODE_PRIVATE)
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 24, 24, 24) }
-        root.addView(TextView(this).apply { text = "Dilmaç Lab"; textSize = 24f; setPadding(0, 0, 0, 16) })
-        keyField = EditText(this).apply {
-            hint = "Gemini API key (stays on this phone)"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            setText(prefs.getString("key", ""))
+        apiKey = prefs.getString("key", "").orEmpty()
+        val tests = listOf(
+            Test("Device and audio routes", "Mics, speakers and Bluetooth links the phone sees") { deviceReport() },
+            Test("Offline speech support", "Which languages this phone recognises without internet") { sttSupport() },
+            Test("Listen: Turkish → English", "Say one Turkish sentence; times recognition + translation") { listen("tr-TR", trEn) },
+            Test("Listen: English → Turkish", "Say one English sentence") { listen("en-US", enTr) },
+            Test("Translation speed", "Times three offline translations") { mlKitSpeed() },
+            Test("Gemini Live Translate", "Cloud voice translation; tap again to stop") {
+                prefs.edit().putString("key", apiKey.trim()).apply()
+                if (geminiRunning) geminiRunning = false else gemini(apiKey.trim())
+            },
+            Test("Two mics at once", "Phone mic + Bluetooth headset together") { twoMics() },
+            Test("Voice output speed", "How fast Turkish and English voices start") { ttsSpeed() },
+        )
+        setContent {
+            DilmacTheme {
+                Scaffold(topBar = {
+                    TopAppBar(
+                        title = { Text("Engine lab") },
+                        navigationIcon = { IconButton(onClick = ::finish) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
+                    )
+                }) { padding ->
+                    val list = rememberLazyListState()
+                    LaunchedEffect(logText) { if (logText.isNotEmpty()) list.animateScrollToItem(tests.size + 2) }
+                    LazyColumn(
+                        state = list,
+                        modifier = Modifier.padding(padding).fillMaxSize(),
+                        contentPadding = PaddingValues(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        item {
+                            OutlinedTextField(
+                                value = apiKey, onValueChange = { apiKey = it },
+                                label = { Text("Gemini API key (stays on this phone)") },
+                                visualTransformation = PasswordVisualTransformation(),
+                                singleLine = true, modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                        items(tests) { t ->
+                            ElevatedCard(Modifier.fillMaxWidth().clickable(onClick = t.run)) {
+                                ListItem(
+                                    headlineContent = { Text(t.title) },
+                                    supportingContent = { Text(t.detail) },
+                                    colors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
+                                )
+                            }
+                        }
+                        item {
+                            FilledTonalButton(onClick = {
+                                getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("dilmac", report))
+                                log("report copied")
+                            }, modifier = Modifier.fillMaxWidth()) { Text("Copy report") }
+                        }
+                        item {
+                            Card(Modifier.fillMaxWidth()) {
+                                SelectionContainer {
+                                    Text(logText, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(14.dp))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
-        root.addView(keyField)
-        fun button(label: String, action: () -> Unit) =
-            root.addView(Button(this).apply { text = label; isAllCaps = false; setOnClickListener { action() } })
-        button("1. Device + audio routes") { deviceReport() }
-        button("2. On-device speech support (TR/EN)") { sttSupport() }
-        button("3. Listen Turkish → EN (on-device + ML Kit)") { listen("tr-TR", trEn) }
-        button("4. Listen English → TR (on-device + ML Kit)") { listen("en-US", enTr) }
-        button("5. ML Kit translate speed") { mlKitSpeed() }
-        button("6. Gemini Live Translate → EN (start/stop)") {
-            prefs.edit().putString("key", keyField.text.toString().trim()).apply()
-            if (geminiRunning) geminiRunning = false else gemini(keyField.text.toString().trim())
-        }
-        button("7. Two mics at once (phone + Bluetooth)") { twoMics() }
-        button("8. Text-to-speech speed (TR/EN)") { ttsSpeed() }
-        button("Copy report") {
-            getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("dilmac", report))
-            log("report copied")
-        }
-        logView = TextView(this).apply { typeface = Typeface.MONOSPACE; textSize = 12f; setTextIsSelectable(true) }
-        root.addView(logView)
-        scroll = ScrollView(this).apply { addView(root); fitsSystemWindows = true }
-        setContentView(scroll)
 
         requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.BLUETOOTH_CONNECT), 1)
-        log("Dilmaç Lab ${packageManager.getPackageInfo(packageName, 0).versionName} — ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})")
+        log("Dilmaç ${packageManager.getPackageInfo(packageName, 0).versionName} — ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})")
     }
 
     override fun onDestroy() {
@@ -100,8 +166,8 @@ class LabActivity : Activity() {
 
     private fun log(line: String) = runOnUiThread {
         report.append(line).append('\n')
-        logView.append(line + "\n")
-        scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
+        logText = report.toString()
+        android.util.Log.d("DilmacLab", line)
     }
 
     private fun hasMic() = (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)

@@ -27,6 +27,14 @@ jobs:
         run: |
           if [ -n "$KS" ]; then mkdir -p ~/.android && echo "$KS" | base64 -d > ~/.android/debug.keystore; fi
 
+      - name: Fetch speaker-ID library and voice model
+        run: |
+          mkdir -p app/libs app/src/main/assets
+          base=https://github.com/k2-fsa/sherpa-onnx/releases/download
+          curl -sSfL -o app/libs/sherpa-onnx-1.13.8.aar $base/v1.13.8/sherpa-onnx-1.13.8.aar
+          curl -sSfL -o app/src/main/assets/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx \
+            $base/speaker-recongition-models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx
+
       - name: Test and build
         shell: bash
         run: |
