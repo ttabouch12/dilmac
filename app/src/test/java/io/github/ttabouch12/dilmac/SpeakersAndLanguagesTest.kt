@@ -24,6 +24,16 @@ class SpeakersAndLanguagesTest {
     }
 
     @Test
+    fun silenceIsDroppedBeforeFingerprinting() {
+        val frame = MicFeed.RATE * 3 / 100
+        val audio = FloatArray(frame * 10) // 10 frames: only frames 2 and 7 are loud
+        for (i in 2 * frame until 3 * frame) audio[i] = 0.5f
+        for (i in 7 * frame until 8 * frame) audio[i] = -0.4f
+        assertEquals(frame * 2, MicFeed.voiceOnly(audio).size)
+        assertEquals(0, MicFeed.voiceOnly(FloatArray(frame * 5)).size) // pure silence: nothing left
+    }
+
+    @Test
     fun languagesNeedTranslationAndSpeech() {
         val langs = Languages.build(
             mlKit = setOf("en", "tr", "he", "ar"),

@@ -5,21 +5,29 @@ import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor
 import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig
+import java.io.IOException
+import java.io.OutputStream
 import kotlin.concurrent.thread
 import kotlin.math.sqrt
 
 /**
- * Keeps the last 20 s of microphone audio so a finished sentence can be cut out and
- * fingerprinted. Runs alongside the speech recogniser (Android lets both listen).
+ * The app's single microphone stream. Android gives the mic to one recorder at a time, so the
+ * speech recogniser listens through [openPipe] instead of opening the mic itself, and the same
+ * audio is kept (last 20 s) for voice fingerprints. Audio recorded while no recogniser is
+ * attached (between sessions) is replayed into the next pipe, so no words are lost.
  */
-class MicTap {
+class MicFeed {
     private val ring = FloatArray(RATE * 20)
     @Volatile private var written = 0L
     @Volatile private var running = false
-    private var rec: AudioRecord? = null
+    /** Feed silence instead of the mic, e.g. while our own voice plays from the speaker. */
+    @Volatile var muted = false
+    @Volatile private var next: OutputStream? = null
+    @Volatile private var generation = 0
 
     /** Total samples recorded so far; use as a timestamp for [slice]. */
     fun position() = written
@@ -28,29 +36,68 @@ class MicTap {
     fun start(): Boolean {
         if (running) return true
         val min = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        val r = AudioRecord(MediaRecorder.AudioSource.MIC, RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, min * 4)
+        val r = AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, min * 8)
         if (r.state != AudioRecord.STATE_INITIALIZED) { r.release(); return false }
-        rec = r
+        val gen = ++generation // a quick stop+start must not leave the old thread running
         running = true
         r.startRecording()
-        thread(name = "mic-tap") {
-            val buf = ShortArray(RATE / 10)
-            while (running) {
+        thread(name = "mic") {
+            val buf = ShortArray(RATE / 10) // 100 ms
+            var out: OutputStream? = null
+            val backlog = ArrayDeque<ByteArray>()
+            while (running && generation == gen) {
                 val n = r.read(buf, 0, buf.size)
                 if (n <= 0) continue
+                if (muted) buf.fill(0.toShort(), 0, n)
                 val base = written
                 for (i in 0 until n) ring[((base + i) % ring.size).toInt()] = buf[i] / 32768f
                 written = base + n
+                val bytes = ByteArray(n * 2)
+                for (i in 0 until n) { bytes[2 * i] = buf[i].toInt().toByte(); bytes[2 * i + 1] = (buf[i].toInt() shr 8).toByte() }
+                next?.let { fresh ->
+                    next = null
+                    closeQuietly(out)
+                    out = fresh
+                    while (backlog.isNotEmpty() && write(fresh, backlog.first())) backlog.removeFirst()
+                }
+                val o = out
+                if (o == null || !write(o, bytes)) {
+                    out = null
+                    backlog.addLast(bytes)
+                    while (backlog.size > 20) backlog.removeFirst() // keep the last 2 s
+                }
             }
+            closeQuietly(out)
             r.stop()
             r.release()
         }
         return true
     }
 
+    /** True if anyone spoke (not just background noise) in the last [ms] milliseconds. */
+    fun heardSpeech(ms: Int): Boolean {
+        val end = written
+        val start = maxOf(0L, end - RATE.toLong() * ms / 1000)
+        var p = start
+        while (p + RATE / 10 <= end) {
+            var sum = 0f
+            for (i in 0 until RATE / 10) { val v = ring[((p + i) % ring.size).toInt()]; sum += v * v }
+            if (sqrt(sum / (RATE / 10)) > 0.02f) return true
+            p += RATE / 10
+        }
+        return false
+    }
+
+    /** A new pipe for the recogniser (16 kHz mono PCM16); the previous one is closed. */
+    fun openPipe(): ParcelFileDescriptor {
+        val (read, write) = ParcelFileDescriptor.createPipe()
+        closeQuietly(next)
+        next = ParcelFileDescriptor.AutoCloseOutputStream(write)
+        return read
+    }
+
     fun stop() {
         running = false
-        rec = null
     }
 
     /** Audio between two [position] values, clipped to what is still in the buffer. */
@@ -60,8 +107,27 @@ class MicTap {
         return FloatArray((to - start).toInt()) { ring[((start + it) % ring.size).toInt()] }
     }
 
+    private fun write(o: OutputStream, b: ByteArray) = try { o.write(b); true } catch (e: IOException) { false }
+    private fun closeQuietly(o: OutputStream?) = try { o?.close() } catch (e: IOException) { }
+
     companion object {
         const val RATE = 16000
+
+        /** Drops quiet 30 ms frames so pauses between words don't blur a voice fingerprint. */
+        fun voiceOnly(samples: FloatArray): FloatArray {
+            val frame = RATE * 3 / 100
+            val frames = (0 until samples.size / frame).map { f ->
+                var sum = 0f
+                for (i in f * frame until (f + 1) * frame) sum += samples[i] * samples[i]
+                sqrt(sum / frame)
+            }
+            val loud = (frames.maxOrNull() ?: 0f) * 0.3f
+            val threshold = maxOf(loud, 0.005f)
+            val kept = frames.indices.filter { frames[it] >= threshold }
+            val out = FloatArray(kept.size * frame)
+            kept.forEachIndexed { k, f -> System.arraycopy(samples, f * frame, out, k * frame, frame) }
+            return out
+        }
     }
 }
 
@@ -73,7 +139,7 @@ class SpeakerId(ctx: Context) {
 
     fun embed(samples: FloatArray): FloatArray? {
         val stream = extractor.createStream()
-        stream.acceptWaveform(samples, MicTap.RATE)
+        stream.acceptWaveform(samples, MicFeed.RATE)
         stream.inputFinished()
         val out = if (extractor.isReady(stream)) extractor.compute(stream) else null
         stream.release()

@@ -4,12 +4,14 @@ import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
+import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -28,10 +30,11 @@ import java.util.Locale
 import java.util.concurrent.Executors
 
 /**
- * Offline conversation engine: on-device speech recognition in a loop, every partial result
- * translated immediately (ML Kit, ~50 ms) so captions update while people are still talking.
+ * Offline conversation engine. The app records the mic itself and streams it into the phone's
+ * on-device recogniser, so listening never stops between sentences; every partial result is
+ * translated at once (ML Kit, ~50 ms) so captions update while people are still talking.
  * Speech in [me]'s language is mine; speech in [them]'s language is someone else's, and their
- * voice fingerprint decides which person it was. All callbacks arrive on the main thread.
+ * voice fingerprint (from the same mic stream) decides which person. Callbacks run on the main thread.
  */
 class LiveTranslator(private val ctx: Context, private val listener: Listener) {
     interface Listener {
@@ -44,12 +47,18 @@ class LiveTranslator(private val ctx: Context, private val listener: Listener) {
         val mine get() = speaker == ME
     }
 
-    /** Say my translated words out of the phone speaker, for the person in front of me. */
+    /**
+     * How audio reaches the recogniser, best first. If the phone rejects one, the engine steps down:
+     * CONTINUOUS = our mic stream, one never-ending session; STREAM = our mic stream, one session per
+     * sentence (gaps replayed); BASIC = the recogniser opens the mic itself (no voice separation).
+     */
+    enum class Mode { CONTINUOUS, STREAM, BASIC }
+
     var speakToThem = true
-    /** Read their translated words into my headphones (only when headphones are connected). */
     var speakToMe = false
-    /** Tell people apart by voice; off = everyone is Person 1. */
     var identifySpeakers = true
+    var mode = Mode.CONTINUOUS
+        private set
 
     var me: Lang = Languages.ENGLISH
         private set
@@ -57,28 +66,32 @@ class LiveTranslator(private val ctx: Context, private val listener: Listener) {
         private set
 
     private val main = Handler(Looper.getMainLooper())
+    private val dog = Handler(Looper.getMainLooper()) // watchdog; separate so relisten() never cancels it
     private val worker = Executors.newSingleThreadExecutor()
     private var toMe: Translator = translator(them, me)
     private var toThem: Translator = translator(me, them)
     private val langId = LanguageIdentification.getClient(
         LanguageIdentificationOptions.Builder().setConfidenceThreshold(0.4f).build()
     )
-    private val recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(ctx)
+    private var recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(ctx)
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private val audio = ctx.getSystemService(AudioManager::class.java)
-    private val mic = MicTap()
+    private val mic = MicFeed()
+    private var pipe: ParcelFileDescriptor? = null
     private val speakerId: SpeakerId? by lazy { SpeakerId.tryCreate(ctx) }
     private val tracker = SpeakerTracker()
 
     private var running = false
-    private var pausedForSpeaker = false
+    private var pausedForSpeaker = 0L // when our own voice started playing (BASIC mode stops listening meanwhile)
     private var useLanguageSwitch = Build.VERSION.SDK_INT >= 34
+    private var sessionStart = 0L
+    private var lastAlive = 0L
+    private var resultsInMode = 0
     private var nextId = 0L
     private var current: Long? = null
     private var lastText = ""
-    private var utteranceStart = 0L
-    private var tSpeech = 0L
+    private var lineStart = 0L
     private var lastPerson = 1
     private val order = LatestWins()
     private val mineGuess = HashMap<Long, Boolean>()
@@ -93,21 +106,27 @@ class LiveTranslator(private val ctx: Context, private val listener: Listener) {
         toThem = translator(me, them)
         warm()
         listOf(me, them).filter { !it.installed }.forEach { Languages.download(ctx, it) }
-        if (running) { recognizer.cancel(); relisten(0) }
+        if (running) restartRecognizer()
     }
 
     fun start() {
         running = true
-        if (identifySpeakers && !mic.start()) listener.onStatus("Voice separation unavailable: mic busy")
-        worker.execute { speakerId } // load the model off the main thread
-        listen()
+        pausedForSpeaker = 0L
+        mic.muted = false
+        if (mode != Mode.BASIC && !mic.start()) stepDown("mic unavailable")
+        worker.execute { speakerId } // load the voice model off the main thread
+        restartRecognizer()
+        dog.removeCallbacksAndMessages(null)
+        dog.postDelayed(watchdog, WATCHDOG_MS)
     }
 
     fun stop() {
         running = false
         main.removeCallbacksAndMessages(null)
+        dog.removeCallbacksAndMessages(null)
         recognizer.cancel()
         mic.stop()
+        closePipe()
         finishCurrent()
         listener.onStatus("Paused")
     }
@@ -126,14 +145,81 @@ class LiveTranslator(private val ctx: Context, private val listener: Listener) {
         worker.shutdown()
     }
 
+    // ── recogniser ────────────────────────────────────────────────────────
+
+    /** A fresh recogniser instance: the old one may be stuck or disconnected. */
+    private fun restartRecognizer() {
+        main.removeCallbacksAndMessages(null)
+        recognizer.destroy()
+        recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(ctx)
+        recognizer.setRecognitionListener(recognition)
+        listen()
+    }
+
     private fun listen() {
-        if (!running || pausedForSpeaker) return
-        recognizer.startListening(intent())
+        if (!running) return
+        if (mode == Mode.BASIC && pausedForSpeaker > 0) return
+        sessionStart = SystemClock.elapsedRealtime()
+        lastAlive = sessionStart
+        val intent = intent()
+        if (mode != Mode.BASIC) {
+            closePipe()
+            val p = mic.openPipe()
+            pipe = p
+            intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, p)
+            intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
+            intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+            intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, MicFeed.RATE)
+            if (mode == Mode.CONTINUOUS) {
+                // The session lasts as long as our audio stream; each sentence arrives as a segment.
+                intent.putExtra(RecognizerIntent.EXTRA_SEGMENTED_SESSION, RecognizerIntent.EXTRA_AUDIO_SOURCE)
+            }
+        }
+        recognizer.startListening(intent)
     }
 
     private fun relisten(delayMs: Long) {
         main.removeCallbacksAndMessages(null)
         main.postDelayed({ listen() }, delayMs)
+    }
+
+    private fun closePipe() {
+        try { pipe?.close() } catch (e: Exception) { }
+        pipe = null
+    }
+
+    private fun stepDown(why: String) {
+        val from = mode
+        mode = when (mode) {
+            Mode.CONTINUOUS -> Mode.STREAM
+            Mode.STREAM -> Mode.BASIC
+            Mode.BASIC -> Mode.BASIC
+        }
+        resultsInMode = 0
+        Log.w(TAG, "listening mode $from → $mode ($why)")
+        if (mode == Mode.BASIC) {
+            mic.stop()
+            closePipe()
+            if (identifySpeakers) listener.onStatus("This phone can't share the mic: voice separation is off")
+        }
+    }
+
+    /** Restarts listening if the recogniser has gone quiet (no callbacks at all, not even volume levels). */
+    private val watchdog = object : Runnable {
+        override fun run() {
+            if (!running) return
+            val now = SystemClock.elapsedRealtime()
+            if (pausedForSpeaker > 0 && now - pausedForSpeaker > 20_000) resumeAfterSpeaking() // playback never finished
+            val waitingForSpeaker = mode == Mode.BASIC && pausedForSpeaker > 0
+            // With our own mic stream, silence is not a stall: only act if someone is actually talking.
+            val talking = mode == Mode.BASIC || mic.heardSpeech(3000)
+            if (!waitingForSpeaker && talking && now - lastAlive > STALL_MS) {
+                Log.w(TAG, "recogniser stalled for ${now - lastAlive} ms in $mode, restarting")
+                if (resultsInMode == 0 && mode != Mode.BASIC) stepDown("no results while people talk")
+                restartRecognizer()
+            }
+            dog.postDelayed(this, WATCHDOG_MS)
+        }
     }
 
     private fun intent() = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -152,44 +238,68 @@ class LiveTranslator(private val ctx: Context, private val listener: Listener) {
     }
 
     private val recognition = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) = listener.onStatus("Listening…")
-        override fun onBeginningOfSpeech() {
-            tSpeech = SystemClock.elapsedRealtime()
-            utteranceStart = mic.position() - MicTap.RATE * 4 / 10 // the recogniser reports speech a little late
-            listener.onStatus("Hearing speech…")
-        }
+        override fun onReadyForSpeech(params: Bundle?) { alive(); listener.onStatus("Listening…") }
+        override fun onBeginningOfSpeech() { alive(); listener.onStatus("Hearing speech…") }
+        override fun onRmsChanged(rmsdB: Float) = alive()
+        override fun onPartialResults(b: Bundle) { alive(); handle(best(b), final = false) }
 
-        override fun onPartialResults(b: Bundle) = handle(best(b), final = false)
         override fun onResults(b: Bundle) {
+            alive()
             handle(best(b), final = true)
             relisten(0)
         }
 
+        override fun onSegmentResults(segmentResults: Bundle) {
+            alive()
+            handle(best(segmentResults), final = true)
+        }
+
+        override fun onEndOfSegmentedSession() {
+            alive()
+            finishCurrent()
+            relisten(0)
+        }
+
         override fun onError(error: Int) {
+            alive()
             finishCurrent()
             if (!running) return
-            when (error) {
-                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> { running = false; listener.onStatus("Microphone permission needed") }
-                SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> {
+            val quick = SystemClock.elapsedRealtime() - sessionStart < 2000 && resultsInMode == 0
+            Log.d(TAG, "recogniser error $error in $mode (quick=$quick)")
+            when {
+                error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
+                    running = false
+                    listener.onStatus("Microphone permission needed")
+                }
+                error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> {
                     listener.onStatus("Downloading offline speech for ${them.name}…")
                     Languages.download(ctx, them)
                     relisten(3000)
                 }
-                SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED, SpeechRecognizer.ERROR_CANNOT_CHECK_SUPPORT -> {
-                    // This phone can't switch languages mid-session: carry on in their language only.
-                    Log.i(TAG, "language switch unsupported (error $error), turning it off")
+                // This phone can't switch languages mid-session: carry on in their language only.
+                useLanguageSwitch && (error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED ||
+                    error == SpeechRecognizer.ERROR_CANNOT_CHECK_SUPPORT) -> {
                     useLanguageSwitch = false
                     relisten(0)
                 }
-                SpeechRecognizer.ERROR_RECOGNIZER_BUSY, SpeechRecognizer.ERROR_SERVER_DISCONNECTED -> relisten(300)
+                // Our audio stream or segmented sessions rejected: try the next simpler way.
+                quick && mode != Mode.BASIC && error in REJECTED -> {
+                    stepDown("error $error")
+                    restartRecognizer()
+                }
+                error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_SERVER_DISCONNECTED ||
+                    error == SpeechRecognizer.ERROR_CLIENT -> main.postDelayed({ restartRecognizer() }, 300)
                 else -> relisten(0) // no match / silence timeout: just keep listening
             }
         }
 
-        override fun onEndOfSpeech() {}
-        override fun onRmsChanged(rmsdB: Float) {}
+        override fun onEndOfSpeech() = alive()
         override fun onBufferReceived(buffer: ByteArray?) {}
         override fun onEvent(eventType: Int, params: Bundle?) {}
+    }
+
+    private fun alive() {
+        lastAlive = SystemClock.elapsedRealtime()
     }
 
     private fun best(b: Bundle) = b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
@@ -199,6 +309,8 @@ class LiveTranslator(private val ctx: Context, private val listener: Listener) {
         if (current != null && lastText.isNotBlank()) handle(lastText, final = true) else current = null
     }
 
+    // ── translation ───────────────────────────────────────────────────────
+
     private fun handle(text: String, final: Boolean) {
         if (text.isBlank()) {
             if (final) finishCurrent()
@@ -206,11 +318,17 @@ class LiveTranslator(private val ctx: Context, private val listener: Listener) {
         }
         val isNew = current == null
         val id = current ?: (++nextId).also { current = it }
-        if (isNew) Log.d(TAG, "first words +${SystemClock.elapsedRealtime() - tSpeech} ms: $text")
+        if (isNew) Log.d(TAG, "first words: $text")
         lastText = if (final) "" else text
-        if (final) current = null
+        if (final) {
+            current = null
+            resultsInMode++
+        }
         val req = order.next()
-        val heard = if (final) mic.slice(utteranceStart, mic.position()) else null
+        // The sentence's audio: everything since the previous sentence ended, at most the last 10 s.
+        val now = mic.position()
+        val heard = if (final && mode != Mode.BASIC) mic.slice(maxOf(lineStart, now - MicFeed.RATE * 10), now) else null
+        if (final) lineStart = now
         val t0 = SystemClock.elapsedRealtime()
         langId.identifyLanguage(text).addOnCompleteListener { task ->
             val lang = if (task.isSuccessful) task.result else "und"
@@ -236,17 +354,18 @@ class LiveTranslator(private val ctx: Context, private val listener: Listener) {
         }
     }
 
-    private fun whoSpoke(samples: FloatArray?, done: (Int) -> Unit) {
-        // Under ~1.2 s there isn't enough voice to tell people apart: assume the last speaker.
-        if (!identifySpeakers || samples == null || samples.size < MicTap.RATE * 12 / 10) {
+    private fun whoSpoke(heard: FloatArray?, done: (Int) -> Unit) {
+        if (!identifySpeakers || heard == null) {
             done(if (identifySpeakers) lastPerson else 1)
             return
         }
         worker.execute {
             val t0 = SystemClock.elapsedRealtime()
-            val embedding = speakerId?.embed(samples)
-            val (person, sim) = embedding?.let { tracker.assign(it) } ?: (lastPerson to Float.NaN)
-            Log.d(TAG, "speaker $person (similarity $sim, ${samples.size / 16} ms audio, ${SystemClock.elapsedRealtime() - t0} ms)")
+            val voice = MicFeed.voiceOnly(heard)
+            // Under ~1 s of actual voice there isn't enough to tell people apart: assume the last speaker.
+            val (person, sim) = if (voice.size < MicFeed.RATE) lastPerson to Float.NaN
+            else speakerId?.embed(voice)?.let { tracker.assign(it) } ?: (lastPerson to Float.NaN)
+            Log.d(TAG, "speaker $person (similarity $sim, ${voice.size / 16} ms voice, ${SystemClock.elapsedRealtime() - t0} ms)")
             main.post {
                 lastPerson = person
                 done(person)
@@ -297,16 +416,15 @@ class LiveTranslator(private val ctx: Context, private val listener: Listener) {
     }
 
     private fun playOnPhoneSpeaker(file: File) {
-        // Stop listening while the speaker talks, or the mic hears our own words and translates them back.
-        pausedForSpeaker = true
-        main.removeCallbacksAndMessages(null)
-        recognizer.cancel()
-        listener.onStatus("Speaking ${them.name}…")
-        val resume = {
-            file.delete()
-            pausedForSpeaker = false
-            if (running) relisten(150)
+        // While our own voice plays, the mic must not hear it, or it gets translated back.
+        pausedForSpeaker = SystemClock.elapsedRealtime()
+        if (mode == Mode.BASIC) {
+            main.removeCallbacksAndMessages(null)
+            recognizer.cancel()
+        } else {
+            mic.muted = true // keep the session running, just feed it silence
         }
+        listener.onStatus("Speaking ${them.name}…")
         try {
             MediaPlayer().apply {
                 setAudioAttributes(
@@ -319,12 +437,24 @@ class LiveTranslator(private val ctx: Context, private val listener: Listener) {
                 audio.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
                     .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
                     ?.let { setPreferredDevice(it) }
-                setOnCompletionListener { it.release(); resume() }
+                setOnCompletionListener { it.release(); file.delete(); resumeAfterSpeaking() }
+                setOnErrorListener { mp, _, _ -> mp.release(); file.delete(); resumeAfterSpeaking(); true }
                 start()
             }
         } catch (e: Exception) {
             Log.w(TAG, "speaker playback failed", e)
-            resume()
+            file.delete()
+            resumeAfterSpeaking()
+        }
+    }
+
+    private fun resumeAfterSpeaking() {
+        if (pausedForSpeaker == 0L) return
+        pausedForSpeaker = 0L
+        mic.muted = false
+        if (running) {
+            listener.onStatus("Listening…")
+            if (mode == Mode.BASIC) relisten(150)
         }
     }
 
@@ -361,7 +491,13 @@ class LiveTranslator(private val ctx: Context, private val listener: Listener) {
         const val ME = 0
         const val UNKNOWN = -1
         private const val TAG = "Dilmac"
+        private const val WATCHDOG_MS = 2000L
+        private const val STALL_MS = 6000L
         private val PITCHES = floatArrayOf(1f, 0.82f, 1.2f, 0.92f, 1.1f)
+        private val REJECTED = setOf(
+            SpeechRecognizer.ERROR_AUDIO, SpeechRecognizer.ERROR_CLIENT, SpeechRecognizer.ERROR_SERVER,
+            SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED, SpeechRecognizer.ERROR_CANNOT_CHECK_SUPPORT,
+        )
     }
 }
 
